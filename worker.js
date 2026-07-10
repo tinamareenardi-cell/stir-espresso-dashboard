@@ -205,10 +205,10 @@ async function squareCount(env, h, from, to, tz, rollover) {
       location_ids: ids,
       query: {
         filter: {
-          date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
+          date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
           state_filter: { states: ['COMPLETED'] }
         },
-        sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
+        sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' }
       },
       limit: 200,
       return_entries: false
