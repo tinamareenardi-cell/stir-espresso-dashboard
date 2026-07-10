@@ -135,6 +135,93 @@ async function xeroPnL(env, h, from, to) {
   return xeroParsePnL(data && data.Reports && data.Reports[0]);
 }
 
+/* ---------------- Square (POS adapter) helpers --------------------------- */
+
+const SQUARE_VERSION = '2024-01-18';
+function squareHeaders(env) {
+  return {
+    'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''),
+    'Square-Version': SQUARE_VERSION,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+}
+
+/* Offset (ms, local-minus-UTC) of a timezone at a given instant, via Intl. */
+function tzOffsetMs(tz, atMs) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const parts = {};
+  for (const p of dtf.formatToParts(new Date(atMs))) parts[p.type] = p.value;
+  let hh = parseInt(parts.hour, 10); if (hh === 24) hh = 0;
+  const asIfUTC = Date.UTC(+parts.year, +parts.month - 1, +parts.day, hh, +parts.minute, +parts.second);
+  return asIfUTC - atMs;
+}
+/* The UTC instant for a wall-clock time (y-m-d h:00) in the venue timezone. */
+function venueWallToUTC(tz, y, m, d, h) {
+  let guess = Date.UTC(y, m - 1, d, h, 0, 0);
+  let off = tzOffsetMs(tz, guess);
+  let utc = guess - off;
+  off = tzOffsetMs(tz, utc);       /* one correction for DST edges */
+  return new Date(guess - off);
+}
+function addDays(y, m, d, n) {
+  const t = new Date(Date.UTC(y, m - 1, d));
+  t.setUTCDate(t.getUTCDate() + n);
+  return [t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate()];
+}
+
+/* Count COMPLETED Square orders across active locations for the trading days
+   from..to inclusive. A trading day boundary is shifted by `rollover` hours
+   (e.g. 4 => sales up to 4am count to the previous day). Voids/cancelled are
+   excluded by the state filter; refunds are separate records and never counted. */
+async function squareCount(env, h, from, to, tz, rollover) {
+  tz = tz || 'Australia/Sydney';
+  const roll = Math.max(0, Math.min(6, rollover || 0));
+  let ids = [];
+  try { ids = JSON.parse(await env.TOKENS.get('meta:pos:locationIds') || '[]'); } catch (e) { ids = []; }
+  if (!ids.length) {
+    const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
+      { headers: squareHeaders(env) });
+    const locs = (data && data.locations) || [];
+    ids = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE').map((l) => l.id);
+    if (!ids.length) ids = locs.map((l) => l.id);
+    if (ids.length) await env.TOKENS.put('meta:pos:locationIds', JSON.stringify(ids));
+  }
+  if (!ids.length) return 0;
+
+  const [fy, fm, fd] = from.split('-').map(Number);
+  const [ty, tm, td] = to.split('-').map(Number);
+  const startAt = venueWallToUTC(tz, fy, fm, fd, roll).toISOString();
+  const [ny, nm, nd] = addDays(ty, tm, td, 1);
+  const endAt = venueWallToUTC(tz, ny, nm, nd, roll).toISOString();
+
+  let count = 0, cursor = null, pages = 0;
+  do {
+    const body = {
+      location_ids: ids,
+      query: {
+        filter: {
+          date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
+          state_filter: { states: ['COMPLETED'] }
+        },
+        sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
+      },
+      limit: 500,
+      return_entries: true
+    };
+    if (cursor) body.cursor = cursor;
+    const data = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
+      { method: 'POST', headers: squareHeaders(env), body: JSON.stringify(body) });
+    count += ((data && data.order_entries) || []).length;
+    cursor = (data && data.cursor) || null;
+  } while (cursor && ++pages < 40);
+  return count;
+}
+
 const ADAPTERS = {
 
   /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
@@ -222,12 +309,48 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    /* Square (production personal access token). Secret: POS_API_TOKEN.
+       Supplies ONLY the completed-transaction count (voids/refunds excluded).
+       Counts COMPLETED orders via Orders Search across the account's active
+       locations, honouring the venue timezone + trading-day rollover. */
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
+        { headers: squareHeaders(env) });
+      const locs = (data && data.locations) || [];
+      const active = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
+      const use = active.length ? active : locs;
+      if (use.length) {
+        await env.TOKENS.put('meta:pos:locationIds', JSON.stringify(use.map((l) => l.id)));
+        await env.TOKENS.put('meta:pos:businessName', (use[0] && use[0].business_name) || '');
+      }
+      const bn = (use[0] && use[0].business_name) || '';
+      const names = use.map((l) => l.name).filter(Boolean).join(', ');
+      return {
+        connected: use.length > 0,
+        org: bn ? (names ? bn + ' — ' + names : bn) : (names || null),
+        sandbox: false
+      };
+    },
+    async fetchRange(env, h, q) {
+      return { count: await squareCount(env, h, q.from, q.to, q.tz, q.rollover) };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth).slice(-24);
+      const out = { months, count: [] };
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        try {
+          out.count.push(await squareCount(env, h, mo + '-01',
+            mo + '-' + String(last).padStart(2, '0'), q.tz, q.rollover));
+        } catch (e) { out.count.push(null); }
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
