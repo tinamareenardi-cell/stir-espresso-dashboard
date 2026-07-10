@@ -205,24 +205,20 @@ async function squareCount(env, h, from, to, tz, rollover) {
       location_ids: ids,
       query: {
         filter: {
-          date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
+          date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
           state_filter: { states: ['COMPLETED'] }
         },
-        sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' }
+        sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
       },
-      limit: 200,
-      return_entries: false
+      limit: 500,
+      return_entries: true
     };
     if (cursor) body.cursor = cursor;
     const data = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
       { method: 'POST', headers: squareHeaders(env), body: JSON.stringify(body) });
-    /* Count only tickets with an actual sale (total > 0), matching Square's
-       Sales summary; this excludes $0 / comped tickets. Refunds are separate
-       records and never reduce the count. */
-    for (const o of ((data && data.orders) || [])) {
-      const amt = o && o.total_money && o.total_money.amount;
-      if (typeof amt === 'number' && amt > 0) count++;
-    }
+    /* Every completed sale counts (matches Square's Sales summary). Refunds are
+       separate records and never reduce the count. */
+    count += ((data && data.order_entries) || []).length;
     cursor = (data && data.cursor) || null;
   } while (cursor && ++pages < 40);
   return count;
